@@ -1,0 +1,96 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Validate before deployment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run db:generate
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/openreply
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    name: Deploy OpenReply
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$VPS_DEPLOY_KEY" > "$HOME/.ssh/openreply-deploy"
+          chmod 600 "$HOME/.ssh/openreply-deploy"
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Upload application source
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          tar \
+            --exclude=.git \
+            --exclude=.env \
+            --exclude=node_modules \
+            --exclude=.next \
+            -czf - . |
+            ssh -i "$HOME/.ssh/openreply-deploy" \
+              -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=yes \
+              "deploy@$VPS_HOST" \
+              'tar -xzf - -C /opt/apps/openreply'
+
+      - name: Build and start OpenReply
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          ssh -i "$HOME/.ssh/openreply-deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "deploy@$VPS_HOST" \
+            'sudo -n /usr/local/sbin/deploy-compose openreply up'
+
+      - name: Verify public health
+        run: |
+          curl --fail --silent --show-error \
+            --retry 12 \
+            --retry-delay 5 \
+            --retry-connrefused \
+            https://openreply.schrodingineer.tech/api/health
